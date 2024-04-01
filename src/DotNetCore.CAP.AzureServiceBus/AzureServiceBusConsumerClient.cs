@@ -54,11 +54,15 @@ internal sealed class AzureServiceBusConsumerClient : IConsumerClient
         ConnectAsync().GetAwaiter().GetResult();
 
         topics = topics.Concat(_asbOptions!.SQLFilters?.Select(o => o.Key) ?? Enumerable.Empty<string>());
+        var topicsSet = new HashSet<string>(topics, StringComparer.OrdinalIgnoreCase);
 
-        var allRules = _administrationClient!.GetRulesAsync(_asbOptions!.TopicPath, _subscriptionName).ToEnumerable();
-        var allRuleNames = allRules.Select(o => o.Name);
+        var allRules = _administrationClient!.GetRulesAsync(_asbOptions!.TopicPath, _subscriptionName).ToEnumerable()
+            .ToHashSet();
+        var allRuleNames = allRules.Select(o => o.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var tasks = new List<Task>();
 
-        foreach (var newRule in topics.Except(allRuleNames))
+        // Create new rules
+        foreach (var newRule in topicsSet.Except(allRuleNames))
         {
             var isSqlRule = _asbOptions.SQLFilters?.FirstOrDefault(o => o.Key == newRule).Value is not null;
 
@@ -84,23 +88,74 @@ internal sealed class AzureServiceBusConsumerClient : IConsumerClient
                 currentRuleToAdd = correlationRule;
             }
 
-            _administrationClient.CreateRuleAsync(_asbOptions.TopicPath, _subscriptionName,
+            tasks.Add(_administrationClient.CreateRuleAsync(_asbOptions.TopicPath, _subscriptionName,
                 new CreateRuleOptions
                 {
                     Name = newRule,
                     Filter = currentRuleToAdd
-                });
+                }));
 
             _logger.LogInformation($"Azure Service Bus add rule: {newRule}");
         }
 
-        foreach (var oldRule in allRuleNames.Except(topics))
+        // Update existing rules
+        foreach (var existingRule in topicsSet.Intersect(allRuleNames))
         {
-            _administrationClient.DeleteRuleAsync(_asbOptions.TopicPath, _subscriptionName, oldRule).GetAwaiter()
-                .GetResult();
+            var isSqlRule = _asbOptions.SQLFilters?.FirstOrDefault(o => o.Key == existingRule).Value is not null;
+
+            RuleFilter? currentRuleToUpdate = null;
+            RuleProperties? existingRuleProperties = allRules.First(o => o.Name == existingRule);
+
+            if (isSqlRule)
+            {
+                var sqlExpression = _asbOptions.SQLFilters?.FirstOrDefault(o => o.Key == existingRule).Value;
+                var definedSqlRule = new SqlRuleFilter(sqlExpression);
+                var existingSqlRule = existingRuleProperties.Filter;
+                if (definedSqlRule != existingSqlRule)
+                {
+                    currentRuleToUpdate = definedSqlRule;
+                }
+            }
+            else
+            {
+                var correlationRule = new CorrelationRuleFilter
+                {
+                    Subject = existingRule
+                };
+
+                foreach (var correlationHeader in _asbOptions.DefaultCorrelationHeaders)
+                {
+                    correlationRule.ApplicationProperties.Add(correlationHeader.Key, correlationHeader.Value);
+                }
+
+                var definedCorrelationRule = existingRuleProperties.Filter;
+
+                if (definedCorrelationRule != correlationRule)
+                {
+                    currentRuleToUpdate = correlationRule;
+                }
+            }
+
+            if (currentRuleToUpdate is null) continue;
+
+            existingRuleProperties.Filter = currentRuleToUpdate;
+            tasks.Add(_administrationClient.UpdateRuleAsync(_asbOptions.TopicPath, _subscriptionName,
+                existingRuleProperties));
+
+            _logger.LogInformation($"Azure Service Bus update rule: {existingRule}");
+        }
+
+        // Delete non declared rules
+        foreach (var oldRule in allRuleNames.Except(topicsSet))
+        {
+            tasks.Add(_administrationClient.DeleteRuleAsync(_asbOptions.TopicPath, _subscriptionName, oldRule));
 
             _logger.LogInformation($"Azure Service Bus remove rule: {oldRule}");
         }
+
+        if (tasks.Count == 0) return;
+
+        Task.WhenAll(tasks).GetAwaiter().GetResult();
     }
 
     public void Listening(TimeSpan timeout, CancellationToken cancellationToken)
